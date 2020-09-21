@@ -1,101 +1,187 @@
 'use strict'
+const Scanner = require('./lib/scanner')
+const Result = require('./lib/result')
+const Token = require('./lib/token')
+const lexer = require('./lib/lexer')
+const { ParserError, ParseError } = require('./lib/error')
+const parser = require('./lib/parser')
 
-var parser = require('./lib/parser')
-var regex = require('./lib/regex')
-var through = require('through2')
-var _ = require('lodash')
-
-function assignOpts (options) {
-  options = _.extend({
-    headerPattern: /^(\w*)(?:\(([\w$.\-*/ ]*)\))?: (.*)$/,
-    headerCorrespondence: ['type', 'scope', 'subject'],
-    referenceActions: [
-      'close',
-      'closes',
-      'closed',
-      'fix',
-      'fixes',
-      'fixed',
-      'resolve',
-      'resolves',
-      'resolved'
-    ],
-    issuePrefixes: ['#'],
-    noteKeywords: ['BREAKING CHANGE'],
-    fieldPattern: /^-(.*?)-$/,
-    revertPattern: /^Revert\s"([\s\S]*)"\s*This reverts commit (\w*)\./,
-    revertCorrespondence: ['header', 'hash'],
-    warn: function () {},
-    mergePattern: null,
-    mergeCorrespondence: null
-  }, options)
-
-  if (typeof options.headerPattern === 'string') {
-    options.headerPattern = new RegExp(options.headerPattern)
-  }
-
-  if (typeof options.headerCorrespondence === 'string') {
-    options.headerCorrespondence = options.headerCorrespondence.split(',')
-  }
-
-  if (typeof options.referenceActions === 'string') {
-    options.referenceActions = options.referenceActions.split(',')
-  }
-
-  if (typeof options.issuePrefixes === 'string') {
-    options.issuePrefixes = options.issuePrefixes.split(',')
-  }
-
-  if (typeof options.noteKeywords === 'string') {
-    options.noteKeywords = options.noteKeywords.split(',')
-  }
-
-  if (typeof options.fieldPattern === 'string') {
-    options.fieldPattern = new RegExp(options.fieldPattern)
-  }
-
-  if (typeof options.revertPattern === 'string') {
-    options.revertPattern = new RegExp(options.revertPattern)
-  }
-
-  if (typeof options.revertCorrespondence === 'string') {
-    options.revertCorrespondence = options.revertCorrespondence.split(',')
-  }
-
-  if (typeof options.mergePattern === 'string') {
-    options.mergePattern = new RegExp(options.mergePattern)
-  }
-
-  return options
+module.exports = function (msg, opts) {
+  return parser(stateType)(msg)
 }
+module.exports.Result = Result
+module.exports.Token = Token
 
-function conventionalCommitsParser (options) {
-  options = assignOpts(options)
-  var reg = regex(options)
+function * stateType (scan) {
+  const type = scan.until(['(', ':', '!', '\n']).trim()
 
-  return through.obj(function (data, enc, cb) {
-    var commit
+  if (!type) {
+    yield new ParseError(scan, `type is required (found type termination "${scan.char || '<end of input>'}")`)
+  } else {
+    yield new Token('type', type)
+  }
 
-    try {
-      commit = parser(data.toString(), options, reg)
-      cb(null, commit)
-    } catch (err) {
-      if (options.warn === true) {
-        cb(err)
-      } else {
-        options.warn(err.toString())
-        cb(null, '')
-      }
+  if (scan.char === '!') {
+    yield new Token('breaking', true)
+    // The first .next consumes the !
+    while (scan.next() === ' ') { }
+  }
+
+  if (scan.char === '(') {
+    yield stateScope
+    return
+  }
+
+  if (scan.char === ':') {
+    if (scan.peek() !== ' ') {
+      yield new ParseError(scan, 'a space is required after the colon')
+    } else {
+      // consume the space
+      scan.next()
     }
-  })
+
+    yield stateDescription
+    return
+  }
 }
 
-function sync (commit, options) {
-  options = assignOpts(options)
-  var reg = regex(options)
+function * stateScope (scan) {
+  let scope = scan.until([')', '\n']).trim()
 
-  return parser(commit, options, reg)
+  if (!scope) {
+    yield new ParseError(scan, `scope cannot be empty (found scope termination ${scan.char || '<end of file>'})`)
+  } else {
+    yield new Token('scope', scope)
+  }
+
+  // consume the closing paren
+  if (scan.char === ')') {
+    scan.next()
+  }
+
+  if (scan.char === '!') {
+    yield new Token('breaking', true)
+    scan.next()
+  }
+
+  if (scan.char === ':') {
+    if (scan.peek() !== ' ') {
+      yield new ParseError(scan, 'a space is required after the colon')
+    } else {
+      // consume the space
+      scan.next()
+    }
+
+    yield stateDescription
+    return
+  }
 }
 
-module.exports = conventionalCommitsParser
-module.exports.sync = sync
+function * stateDescription (scan) {
+  let description = scan.until(['\n']).trim()
+
+  if (!description) {
+    yield new ParseError(scan, `description is required (found description termination ${scan.char === '\n' ? '<new line>' : '<end of file>'})`)
+  } else {
+    yield new Token('description', description)
+  }
+
+  yield stateBody
+}
+
+function * stateBody (scan) {
+  const lines = []
+  let line = scan.until(['\n'])
+  while (line !== undefined) {
+    if (isFooter(line)) {
+      // plus one because we are now on the newline char after
+      scan.putBack(line.length + 1)
+      break
+    } else {
+      lines.push(line)
+    }
+    line = scan.until(['\n'])
+  }
+
+  // Ensure we have one leading empty line if we have body content
+  if (lines[0] !== '\n' && !lines.filter((l) => !!l.trim()).length) {
+    yield new ParseError(scan, 'one blank line is required before body')
+  }
+
+  const body = lines.join('')
+  if (body) {
+    yield new Token('body', body.trim())
+  }
+
+  yield stateFooters
+}
+
+function * stateFooters (scan) {
+  let footer
+  let line = scan.until(['\n'])
+  while (line !== undefined) {
+    const _footer = isFooter(line)
+    if (_footer) {
+      if (footer) {
+        if (footer.token === 'BREAKING CHANGE' || footer.token === 'BREAKING-CHANGE') {
+          yield new Token('breaking', true)
+        }
+        // Trim value
+        footer.value = footer.value.trim()
+        yield new Token('footers', footer)
+      }
+      footer = _footer
+    } else if (footer) {
+      // Append line to previous footer
+      footer.raw += line
+      footer.value += line
+    } else {
+      throw ParserError('unexpexted state')
+    }
+
+    line = scan.until(['\n'])
+  }
+  if (footer) {
+    if (footer.token === 'BREAKING CHANGE' || footer.token === 'BREAKING-CHANGE') {
+      yield new Token('breaking', true)
+    }
+    // Trim value
+    footer.value = footer.value.trim()
+    yield new Token('footers', footer)
+  }
+}
+
+function isFooter (line) {
+  const colonSep = line.indexOf(': ')
+  const hashSep = line.indexOf(' #')
+  if (!line || (colonSep === -1 && hashSep === -1)) {
+    return false
+  }
+
+  let parts
+  let sep
+  if (hashSep === -1 || colonSep > hashSep) {
+    sep = ': '
+  } else {
+    sep = ' #'
+  }
+  parts = line.split(sep)
+
+  // Check token
+  const token = parts.shift()
+  if (token !== 'BREAKING CHANGE' && token.includes(' ')) {
+    return false
+  }
+
+  const value = parts.join(sep).trim()
+  if (!value) {
+    return false
+  }
+
+  return {
+    raw: line,
+    token: token,
+    separator: sep,
+    value: value
+  }
+}
